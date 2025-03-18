@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'can_receiver_node = ioniq5_can_pub.ros_can_pub:main'
         ],
     },
 )

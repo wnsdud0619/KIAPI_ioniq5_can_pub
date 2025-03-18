@@ -1,13 +1,16 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Header  
+from std_msgs.msg import Header  
 import can
-from can.matrix import dbc
+import cantools
+import threading
+import queue
+import asyncio
 from autoware_vehicle_msgs.msg import *
-import time
-import rospy
+from rclpy.clock import Clock
+from rclpy.executors import MultiThreadedExecutor
 
-# CAN - 0:P, 7:R, N:6, D:5 , Autoware - 22:P, 20:R, 1:N, 2:D
+# 기어 변환 딕셔너리
 Gear_DISP_dict = { 
     0 : 22,
     7 : 20,
@@ -15,180 +18,106 @@ Gear_DISP_dict = {
     5 : 2,
 }
 
-class can710():
-    def __init__(self, _EPS_control_state, _EPS_Enable_FB, _Control_SW_FB, _Override_state, _StrAng, _Str_Tq_1, _Str_Tq_2, _EPS_Alive_Cnt):
-        self.EPS_control_state = _EPS_control_state
-        self.EPS_Enable_FB = _EPS_Enable_FB
-        self.Control_SW_FB = _Control_SW_FB
-        self.Override_state = _Override_state
-        self.StrAng = _StrAng
-        self.Str_Tq_1 = _Str_Tq_1
-        self.Str_Tq_2 = _Str_Tq_2
-        self.EPS_Alive_Cnt = _EPS_Alive_Cnt
-	
-class can711():
-    def __init__(self, _ACC_Control_state, _ACC_En_FB, _AEB_State, _Override_ACC_state, _Override_BRK_state, _Vehicle_speed, _Gear_DISP):
-        self.ACC_Control_state = _ACC_Control_state
-        self.ACC_En_FB = _ACC_En_FB
-        self.AEB_State = _AEB_State
-        self.Override_ACC_state = _Override_ACC_state
-        self.Override_BRK_state = _Override_BRK_state
-        self.Vehicle_speed = _Vehicle_speed
-        self.Gear_DISP = _Gear_DISP
-    
-class can713():
-    def __init__(self, _Long_Accel, _Lat_Accel, _Yaw_Rate):
-        self.Long_Accel = _Long_Accel
-        self.Lat_Accel = _Lat_Accel
-        self.Yaw_Rate = _Yaw_Rate
-    
-class can715():
-    def __init__(self, _vehicle_speed, _steering_angle, _brake_position, _accel_position, _turn_signal_right, _hazard, _turn_signal_left):
-        self.vehicle_speed = _vehicle_speed
-        self.steering_angle = _steering_angle
-        self.brake_position = _brake_position
-        self.accel_position = _accel_position
-        self.turn_signal_right = _turn_signal_right
-        self.hazard = _hazard
-        self.turn_signal_left = _turn_signal_left
-   
-
 class CanReceiver(Node):
     def __init__(self):
         super().__init__('can_receiver_node')
 
-        self.can710 = can710(0, 0, 0, 0, 0, 0, 0, 0)
-        self.can711 = can711(0, 0, 0, 0, 0, 0, 0)
-        self.can713 = can713(0, 0, 0)
-        self.can715 = can715(0, 0, 0, 0, 0, 0, 0, 0)
-
         # ROS 2 퍼블리셔 생성
-        self.pub_ControlModeReport = self.create_publisher(ControlModeReport, '/vehicle/status/ControlModeReport', 10)
         self.pub_GearReport = self.create_publisher(GearReport, '/vehicle/status/GearReport', 10)
-        self.pub_SteerReport = self.create_publisher(SteerReport, '/vehicle/status/SteerReport', 10)
+        self.pub_SteeringReport = self.create_publisher(SteeringReport, '/vehicle/status/SteeringReport', 10)
         self.pub_VelocityReport = self.create_publisher(VelocityReport, '/vehicle/status/VelocityReport', 10)
-        
-        # CAN 인터페이스 설정
-        self.bus = can.Bus(interface='socketcan', channel='can0')  # 'vcan0'는 예시입니다. 실제 CAN 인터페이스 이름을 사용하세요.
 
-        # DBC 파일 로드 (사용할 DBC 파일 경로를 지정)
-        self.dbc = canmatrix.loadp('KIAPI.dbc')  # DBC 파일 경로를 지정해야 합니다
+        # CAN 인터페이스 설정 (ThreadSafeBus 사용)
+        self.bus = can.ThreadSafeBus(interface='socketcan', channel='can0')
 
-        # 데이터 수신 및 퍼블리시
-        self.create_timer(0.01, self.timer_callback)  # 0.01초마다 콜백 함수 호출
+        # DBC 파일 로드 및 메시지 캐싱 (속도 향상)
+        self.dbc = cantools.database.load_file('/home/kiapi/KIAPI_ioniq5_can_pub/KIAPI.dbc')
+        self.dbc_messages = {msg.frame_id: msg for msg in self.dbc.messages}
+
+        # CAN 메시지 수신 큐 (멀티스레드, 최대 크기 제한)
+        self.msg_queue = queue.Queue(maxsize=1000)
+
+        # CAN 데이터 수신을 비동기 스레드에서 실행
+        self.can_thread = threading.Thread(target=self.can_receive_thread, daemon=True)
+        self.can_thread.start()
+
+        # 데이터 수신 및 퍼블리시 (5ms 주기)
+        self.create_timer(0.002, self.timer_callback)  # 2ms 주기
+
+    def can_receive_thread(self):
+        """CAN 메시지를 별도 스레드에서 수신하여 큐에 저장"""
+        while rclpy.ok():
+            try:
+                message = self.bus.recv(timeout=0.0001)  # 타임아웃 최소화
+                if message:
+                    if not self.msg_queue.full():  # 큐가 가득 찬 경우 데이터 삭제 방지
+                        self.msg_queue.put_nowait(message)
+            except queue.Full:
+                pass  # 큐가 가득 차면 버퍼 오버플로우 방지
 
     def timer_callback(self):
-        # CAN 메시지 수신
-        message = self.bus.recv()
+        """메인 스레드에서 CAN 데이터를 가져와 퍼블리시"""
+        while not self.msg_queue.empty():
+            try:
+                message = self.msg_queue.get_nowait()
+            except queue.Empty:
+                return  # 큐가 비어 있으면 처리 안 함
 
-        if message is not None and message.arbitration_id == 0x710:  # CAN ID 0x710만 처리
-            
-            SteerReport_msg = SteerReport()
-            # 메시지 ID가 0x156인 경우
-            self.get_logger().info(f"Received CAN message with ID: {hex(message.arbitration_id)}")
-            #binary_data = ' '.join(f'{byte:08b}' for byte in message.data)  # 각 바이트를 2진법으로 변환
-
-            # CAN 메시지에서 신호 디코딩 (DBC 파일에서 해당 메시지를 찾음)
             decoded_signals = self.decode_message(message)
+            if not decoded_signals:
+                continue  # 디코딩 실패 시 스킵
 
-            # 원하는 신호만 선택하여 문자열로 변환
-            selected_signals = {key: decoded_signals[key] for key in ['EPS_control_state', 'EPS_Enable_FB', 'Control_SW_FB', 'Override_state', 'StrAng'] if key in decoded_signals}
-            self.can710.EPS_control_state = selected_signals['EPS_control_state']
-            self.can710.EPS_Enable_FB = selected_signals['EPS_Enable_FB']
-            self.can710.Control_SW_FB = selected_signals['Control_SW_FB']
-            self.can710.Override_state = selected_signals['Override_state']
-            self.can710.StrAng = selected_signals['StrAng']
-            SteerReport_msg.steering_tire_angle = self.can710.StrAng
+            # 공통 헤더 설정
+            header = Header()
+            header.frame_id = 'base_link'
+            header.stamp = Clock().now().to_msg()
 
-        if message is not None and message.arbitration_id == 0x711:  # CAN ID 0x711만 처리
+            # 메시지 처리
+            if message.arbitration_id == 0x710:
+                SteeringReport_msg = SteeringReport()
+                SteeringReport_msg.steering_tire_angle = decoded_signals.get('StrAng', 0)
+                SteeringReport_msg.stamp = header.stamp
+                self.pub_SteeringReport.publish(SteeringReport_msg)
 
-            GearReport_msg = GearReport()
-            # 메시지 ID가 0x156인 경우
-            self.get_logger().info(f"Received CAN message with ID: {hex(message.arbitration_id)}")
-            #binary_data = ' '.join(f'{byte:08b}' for byte in message.data)  # 각 바이트를 2진법으로 변환
+            elif message.arbitration_id == 0x711:
+                GearReport_msg = GearReport()
+                gear_disp = decoded_signals.get('Gear_DISP', 0)
+                GearReport_msg.report = Gear_DISP_dict.get(gear_disp, 0)
+                GearReport_msg.stamp = header.stamp
+                self.pub_GearReport.publish(GearReport_msg)
 
-            # CAN 메시지에서 신호 디코딩 (DBC 파일에서 해당 메시지를 찾음)
-            decoded_signals = self.decode_message(message)
-
-            # 원하는 신호만 선택하여 문자열로 변환
-            selected_signals = {key: decoded_signals[key] for key in ['ACC_Control_state', 'ACC_En_FB', 'AEB_State', 'Gear_DISP'] if key in decoded_signals}
-            self.can711.ACC_Control_state = selected_signals['ACC_Control_state']
-            self.can711.ACC_En_FB = selected_signals['ACC_En_FB']
-            self.can711.AEB_State = selected_signals['AEB_State']
-            self.can711.Gear_DISP = selected_signals['Gear_DISP']
-
-            GearReport_msg.report = Gear_DISP_dict.get(self.can711.Gear_DISP)
-
-        if message is not None and message.arbitration_id == 0x713:  # CAN ID 0x713만 처리
-            #ros msg 생성            
-            VelocityReport_msg = VelocityReport()
-            # 메시지 ID가 0x156인 경우
-            self.get_logger().info(f"Received CAN message with ID: {hex(message.arbitration_id)}")
-            #binary_data = ' '.join(f'{byte:08b}' for byte in message.data)  # 각 바이트를 2진법으로 변환
-
-            # CAN 메시지에서 신호 디코딩 (DBC 파일에서 해당 메시지를 찾음)
-            decoded_signals = self.decode_message(message)
-
-            # 원하는 신호만 선택하여 문자열로 변환
-            selected_signals = {key: decoded_signals[key] for key in ['Long_Accel', 'Lat_Accel', 'Yaw_Rate'] if key in decoded_signals}
-
-            self.can713.Long_Accel = selected_signals['Long_Accel']
-            self.can713.Lat_Accel = selected_signals['Lat_Accel']
-            self.can713.Yaw_Rate = selected_signals['Yaw_Rate']
-
-            VelocityReport_msg.longitudinal_velocity = self.can713.Long_Accel
-            VelocityReport_msg.lateral_velocity = self.can713.Lat_Accel
-            VelocityReport_msg.heading_rate = self.can713.Yaw_Rate
-            
-        if message is not None and message.arbitration_id == 0x715:  # CAN ID 0x715만 처리
-            # 메시지 ID가 0x156인 경우
-            self.get_logger().info(f"Received CAN message with ID: {hex(message.arbitration_id)}")
-            #binary_data = ' '.join(f'{byte:08b}' for byte in message.data)  # 각 바이트를 2진법으로 변환
-
-            # CAN 메시지에서 신호 디코딩 (DBC 파일에서 해당 메시지를 찾음)
-            decoded_signals = self.decode_message(message)
-
-            # 원하는 신호만 선택하여 문자열로 변환
-            selected_signals = {key: decoded_signals[key] for key in ['Long_Accel', 'Lat_Accel', 'Yaw_Rate'] if key in decoded_signals}
-           
-        header = Header()
-        header.frame_id = 'base_link'
-        header.stamp = rospy.Time.now()
-
-        #ControlModeReport_msg = ControlModeReport()
-        
-        VelocityReport_msg.header = header
-        GearReport_msg.stamp = header.stamp
-        SteerReport_msg.stamp = header.stamp
-
-        self.pub_ControlModeReport.publish(VelocityReport_msg)
-        self.pub_GearReport.publish(GearReport_msg)
-        self.pub_SteerReport.publish(SteerReport_msg)
-        #self.get_logger().info(f"Published selected CAN data: {msg.data}")
+            elif message.arbitration_id == 0x713:
+                VelocityReport_msg = VelocityReport()
+                VelocityReport_msg.longitudinal_velocity = decoded_signals.get('Long_Accel', 0)
+                VelocityReport_msg.lateral_velocity = decoded_signals.get('Lat_Accel', 0)
+                VelocityReport_msg.heading_rate = decoded_signals.get('Yaw_Rate', 0)
+                VelocityReport_msg.header = header
+                self.pub_VelocityReport.publish(VelocityReport_msg)
 
     def decode_message(self, message):
-        decoded_data = {}
-        # CAN 메시지에서 신호들을 디코딩하여 변수명과 값을 딕셔너리로 반환
+        """캐싱된 DBC 메시지를 사용하여 디코딩"""
         try:
-            can_message = self.dbc.get_message_by_id(message.arbitration_id)
-            for signal in can_message.signals:
-                signal_value = signal.decode(message.data)
-                decoded_data[signal.name] = signal_value
+            can_message = self.dbc_messages.get(message.arbitration_id)
+            if can_message:
+                return can_message.decode(message.data)
         except Exception as e:
             self.get_logger().error(f"Failed to decode message: {e}")
-        return decoded_data
-
+        return {}
 
 def main(args=None):
     rclpy.init(args=args)
 
+    # 다중 스레드 실행을 위한 Executor 설정
+    executor = MultiThreadedExecutor()
     can_receiver_node = CanReceiver()
+    executor.add_node(can_receiver_node)
 
-    rclpy.spin(can_receiver_node)
-
-    can_receiver_node.destroy_node()
-    rclpy.shutdown()
-
+    # 병렬 실행 시작
+    try:
+        executor.spin()
+    finally:
+        can_receiver_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
