@@ -10,7 +10,7 @@ from autoware_vehicle_msgs.msg import *
 from rclpy.clock import Clock
 from rclpy.executors import MultiThreadedExecutor
 
-# 기어 변환 딕셔너리
+# 기어 변환 딕셔너리 (P:0, R:7, N:6, D:5)
 Gear_DISP_dict = { 
     0 : 22,
     7 : 20,
@@ -23,15 +23,15 @@ class CanReceiver(Node):
         super().__init__('can_receiver_node')
 
         # ROS 2 퍼블리셔 생성
-        self.pub_GearReport = self.create_publisher(GearReport, '/vehicle/status/GearReport', 10)
-        self.pub_SteeringReport = self.create_publisher(SteeringReport, '/vehicle/status/SteeringReport', 10)
-        self.pub_VelocityReport = self.create_publisher(VelocityReport, '/vehicle/status/VelocityReport', 10)
+        self.pub_GearReport = self.create_publisher(GearReport, '/vehicle/status/gear_status', 10)
+        self.pub_SteeringReport = self.create_publisher(SteeringReport, '/vehicle/status/steering_status', 10)
+        self.pub_VelocityReport = self.create_publisher(VelocityReport, '/vehicle/status/velocity_status', 10)
 
         # CAN 인터페이스 설정 (ThreadSafeBus 사용)
         self.bus = can.ThreadSafeBus(interface='socketcan', channel='can0')
 
         # DBC 파일 로드 및 메시지 캐싱 (속도 향상)
-        self.dbc = cantools.database.load_file('/home/kiapi/KIAPI_ioniq5_can_pub/KIAPI.dbc')
+        self.dbc = cantools.database.load_file('../../../KIAPI.dbc')
         self.dbc_messages = {msg.frame_id: msg for msg in self.dbc.messages}
 
         # CAN 메시지 수신 큐 (멀티스레드, 최대 크기 제한)
