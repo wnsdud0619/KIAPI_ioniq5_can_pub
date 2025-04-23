@@ -26,12 +26,14 @@ class CanReceiver(Node):
         self.pub_GearReport = self.create_publisher(GearReport, '/vehicle/status/gear_status', 10)
         self.pub_SteeringReport = self.create_publisher(SteeringReport, '/vehicle/status/steering_status', 10)
         self.pub_VelocityReport = self.create_publisher(VelocityReport, '/vehicle/status/velocity_status', 10)
+        self.pub_HazardLightsReport = self.create_publisher(HazardLightsReport, '/vehicle/status/hazard_lights_status', 10)
+        self.pub_TurnIndicatorsReport = self.create_publisher(TurnIndicatorsReport, '/vehicle/status/turn_indicators_status', 10)
 
         # CAN 인터페이스 설정 (ThreadSafeBus 사용)
         self.bus = can.ThreadSafeBus(interface='socketcan', channel='can0')
 
         # DBC 파일 로드 및 메시지 캐싱 (속도 향상)
-        self.dbc = cantools.database.load_file('../../../KIAPI.dbc')
+        self.dbc = cantools.database.load_file('KIAPI.dbc')
         self.dbc_messages = {msg.frame_id: msg for msg in self.dbc.messages}
 
         # CAN 메시지 수신 큐 (멀티스레드, 최대 크기 제한)
@@ -81,8 +83,9 @@ class CanReceiver(Node):
 
             elif message.arbitration_id == 0x711:
                 GearReport_msg = GearReport()
-                gear_disp = decoded_signals.get('Gear_DISP', 0)
-                GearReport_msg.report = Gear_DISP_dict.get(gear_disp, 0)
+                gear_disp = decoded_signals.get('Gear_Disp', 0)
+                gear_value = getattr(gear_disp, "value", gear_disp)
+                GearReport_msg.report = Gear_DISP_dict.get(gear_value, 0)                
                 GearReport_msg.stamp = header.stamp
                 self.pub_GearReport.publish(GearReport_msg)
 
@@ -92,7 +95,19 @@ class CanReceiver(Node):
                 VelocityReport_msg.lateral_velocity = decoded_signals.get('Lat_Accel', 0)
                 VelocityReport_msg.heading_rate = decoded_signals.get('Yaw_Rate', 0)
                 VelocityReport_msg.header = header
-                self.pub_VelocityReport.publish(VelocityReport_msg)
+                #self.pub_VelocityReport.publish(VelocityReport_msg)
+
+            elif message.arbitration_id == 0x715:
+                HazardLightsReport_msg = HazardLightsReport()
+                TurnIndicatorsReport_msg = TurnIndicatorsReport()
+
+                #msg에 can값 넣어서 변하도록 해야함 현재는 기본값만 넣음
+                HazardLightsReport_msg.report = 1  # DISABLE = 1, ENABLE = 2
+                TurnIndicatorsReport_msg.report = 0 # No command = 0, DISABLE = 1, ENABLE_LEFT = 2, ENABLE_RIGHT = 3
+                HazardLightsReport_msg.stamp = header.stamp
+                TurnIndicatorsReport_msg.stamp = header.stamp
+                self.pub_HazardLightsReport.publish(HazardLightsReport_msg)
+                self.pub_TurnIndicatorsReport.publish(TurnIndicatorsReport_msg)
 
     def decode_message(self, message):
         """캐싱된 DBC 메시지를 사용하여 디코딩"""
